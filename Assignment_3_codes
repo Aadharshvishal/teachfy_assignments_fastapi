@@ -1,0 +1,1932 @@
+ROUTERS_AUTH.PY
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from database import get_db
+from models import User
+from schemas import UserCreate, User as UserSchema, Token
+from auth import (
+    authenticate_user, 
+    create_access_token, 
+    get_password_hash, 
+    get_user_by_username,
+    get_user_by_email,
+    get_current_active_user
+)
+from datetime import timedelta
+
+router = APIRouter(prefix="/auth", tags=["authentication"])
+
+@router.post("/register", response_model=UserSchema, status_code=status.HTTP_201_CREATED)
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    """Register a new user"""
+    # Check if username already exists
+    if get_user_by_username(db, user.username):
+        raise HTTPException(
+            status_code=400,
+            detail="Username already registered"
+        )
+    
+    # Check if email already exists
+    if get_user_by_email(db, user.email):
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    hashed_password = get_password_hash(user.password)
+    db_user = User(
+        username=user.username,
+        email=user.email,
+        hashed_password=hashed_password,
+        is_active=user.is_active
+    )
+    
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    
+    return db_user
+
+@router.post("/login", response_model=Token)
+def login_user(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """Login user and return access token"""
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=30)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@router.get("/me", response_model=UserSchema)
+def read_users_me(current_user: User = Depends(get_current_active_user)):
+    """Get current user information"""
+    return current_user
+
+@router.get("/users/me/items/")
+def read_own_items(current_user: User = Depends(get_current_active_user)):
+    """Get current user's books"""
+    return [{"item_id": "Foo", "owner": current_user.username}]
+
+
+ROUTERS_AUTHORS.PY
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from database import get_db
+from models import Author
+from schemas import AuthorCreate, AuthorUpdate, Author as AuthorSchema
+
+router = APIRouter(prefix="/authors", tags=["authors"])
+
+@router.get("/", response_model=List[AuthorSchema])
+def get_authors(
+    skip: int = Query(0, ge=0, description="Number of authors to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of authors to return"),
+    name: Optional[str] = Query(None, description="Filter by author name (partial match)"),
+    email: Optional[str] = Query(None, description="Filter by author email (partial match)"),
+    is_active: Optional[bool] = Query(None, description="Filter by active status"),
+    db: Session = Depends(get_db)
+):
+    """Get all authors with filtering and pagination"""
+    query = db.query(Author)
+    
+    # Apply filters
+    if name:
+        query = query.filter(Author.name.ilike(f"%{name}%"))
+    if email:
+        query = query.filter(Author.email.ilike(f"%{email}%"))
+    if is_active is not None:
+        query = query.filter(Author.is_active == is_active)
+    
+    # Apply pagination
+    authors = query.offset(skip).limit(limit).all()
+    return authors
+
+@router.get("/{author_id}", response_model=AuthorSchema)
+def get_author(author_id: int, db: Session = Depends(get_db)):
+    """Get a specific author by ID"""
+    author = db.query(Author).filter(Author.id == author_id).first()
+    if not author:
+        raise HTTPException(status_code=404, detail="Author not found")
+    return author
+
+@router.post("/", response_model=AuthorSchema, status_code=status.HTTP_201_CREATED)
+def create_author(author: AuthorCreate, db: Session = Depends(get_db)):
+    """Create a new author"""
+    # Check if email already exists
+    existing_author = db.query(Author).filter(Author.email == author.email).first()
+    if existing_author:
+        raise HTTPException(status_code=400, detail="Email already exists")
+    
+    db_author = Author(**author.model_dump())
+    db.add(db_author)
+    db.commit()
+    db.refresh(db_author)
+    return db_author
+
+@router.put("/{author_id}", response_model=AuthorSchema)
+def update_author(author_id: int, author: AuthorUpdate, db: Session = Depends(get_db)):
+    """Update an author"""
+    db_author = db.query(Author).filter(Author.id == author_id).first()
+    if not db_author:
+        raise HTTPException(status_code=404, detail="Author not found")
+    
+    # Check if email already exists (if being updated)
+    if author.email and author.email != db_author.email:
+        existing_author = db.query(Author).filter(Author.email == author.email).first()
+        if existing_author:
+            raise HTTPException(status_code=400, detail="Email already exists")
+    
+    # Update only provided fields
+    update_data = author.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_author, field, value)
+    
+    db.commit()
+    db.refresh(db_author)
+    return db_author
+
+@router.delete("/{author_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_author(author_id: int, db: Session = Depends(get_db)):
+    """Delete an author"""
+    author = db.query(Author).filter(Author.id == author_id).first()
+    if not author:
+        raise HTTPException(status_code=404, detail="Author not found")
+    
+    db.delete(author)
+    db.commit()
+    return None
+
+
+ROUTERS_BOOKS.PY
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.orm import Session
+from sqlalchemy import and_
+from typing import List, Optional
+from database import get_db
+from models import Book, Author, User
+from schemas import BookCreate, BookUpdate, Book as BookSchema, VoteCreate, VoteResponse
+from auth import get_current_active_user
+
+router = APIRouter(prefix="/books", tags=["books"])
+
+@router.get("/", response_model=List[BookSchema])
+def get_books(
+    skip: int = Query(0, ge=0, description="Number of books to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of books to return"),
+    title: Optional[str] = Query(None, description="Filter by book title (partial match)"),
+    isbn: Optional[str] = Query(None, description="Filter by ISBN"),
+    author_id: Optional[int] = Query(None, description="Filter by author ID"),
+    author_name: Optional[str] = Query(None, description="Filter by author name (partial match)"),
+    is_published: Optional[bool] = Query(None, description="Filter by published status"),
+    min_price: Optional[float] = Query(None, description="Minimum price filter"),
+    max_price: Optional[float] = Query(None, description="Maximum price filter"),
+    db: Session = Depends(get_db)
+):
+    """Get all books with filtering and pagination"""
+    query = db.query(Book)
+    
+    # Apply filters
+    if title:
+        query = query.filter(Book.title.ilike(f"%{title}%"))
+    if isbn:
+        query = query.filter(Book.isbn.ilike(f"%{isbn}%"))
+    if author_id:
+        query = query.filter(Book.author_id == author_id)
+    if author_name:
+        query = query.join(Author).filter(Author.name.ilike(f"%{author_name}%"))
+    if is_published is not None:
+        query = query.filter(Book.is_published == is_published)
+    if min_price is not None:
+        query = query.filter(Book.price.isnot(None))
+        # Note: In a real app, you'd parse price strings to float for comparison
+    if max_price is not None:
+        query = query.filter(Book.price.isnot(None))
+        # Note: In a real app, you'd parse price strings to float for comparison
+    
+    # Apply pagination
+    books = query.offset(skip).limit(limit).all()
+    
+    # Add vote count to each book
+    for book in books:
+        book.vote_count = len(book.voters)
+    
+    return books
+
+@router.get("/{book_id}", response_model=BookSchema)
+def get_book(book_id: int, db: Session = Depends(get_db)):
+    """Get a specific book by ID"""
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Add vote count
+    book.vote_count = len(book.voters)
+    return book
+
+@router.post("/", response_model=BookSchema, status_code=status.HTTP_201_CREATED)
+def create_book(
+    book: BookCreate, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Create a new book (requires authentication)"""
+    # Check if author exists
+    author = db.query(Author).filter(Author.id == book.author_id).first()
+    if not author:
+        raise HTTPException(status_code=400, detail="Author not found")
+    
+    # Check if ISBN already exists (if provided)
+    if book.isbn:
+        existing_book = db.query(Book).filter(Book.isbn == book.isbn).first()
+        if existing_book:
+            raise HTTPException(status_code=400, detail="ISBN already exists")
+    
+    db_book = Book(**book.model_dump(), owner_id=current_user.id)
+    db.add(db_book)
+    db.commit()
+    db.refresh(db_book)
+    
+    # Add vote count
+    db_book.vote_count = 0
+    return db_book
+
+@router.put("/{book_id}", response_model=BookSchema)
+def update_book(
+    book_id: int, 
+    book: BookUpdate, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Update a book (only the owner can update)"""
+    db_book = db.query(Book).filter(Book.id == book_id).first()
+    if not db_book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Check if current user is the owner
+    if db_book.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403, 
+            detail="Not enough permissions. Only the book owner can update this book."
+        )
+    
+    # Check if author exists (if being updated)
+    if book.author_id and book.author_id != db_book.author_id:
+        author = db.query(Author).filter(Author.id == book.author_id).first()
+        if not author:
+            raise HTTPException(status_code=400, detail="Author not found")
+    
+    # Check if ISBN already exists (if being updated)
+    if book.isbn and book.isbn != db_book.isbn:
+        existing_book = db.query(Book).filter(Book.isbn == book.isbn).first()
+        if existing_book:
+            raise HTTPException(status_code=400, detail="ISBN already exists")
+    
+    # Update only provided fields
+    update_data = book.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_book, field, value)
+    
+    db.commit()
+    db.refresh(db_book)
+    
+    # Add vote count
+    db_book.vote_count = len(db_book.voters)
+    return db_book
+
+@router.delete("/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_book(
+    book_id: int, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Delete a book (only the owner can delete)"""
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Check if current user is the owner
+    if book.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403, 
+            detail="Not enough permissions. Only the book owner can delete this book."
+        )
+    
+    db.delete(book)
+    db.commit()
+    return None
+
+@router.get("/search/advanced", response_model=List[BookSchema])
+def advanced_search(
+    q: Optional[str] = Query(None, description="Search query for title and description"),
+    author_id: Optional[int] = Query(None, description="Filter by author ID"),
+    is_published: Optional[bool] = Query(None, description="Filter by published status"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db)
+):
+    """Advanced search with multiple filters"""
+    query = db.query(Book)
+    
+    if q:
+        query = query.filter(
+            and_(
+                Book.title.ilike(f"%{q}%"),
+                Book.description.ilike(f"%{q}%")
+            )
+        )
+    if author_id:
+        query = query.filter(Book.author_id == author_id)
+    if is_published is not None:
+        query = query.filter(Book.is_published == is_published)
+    
+    books = query.offset(skip).limit(limit).all()
+    
+    # Add vote count to each book
+    for book in books:
+        book.vote_count = len(book.voters)
+    
+    return books
+
+
+ROUTERS_VOTES.PY
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from database import get_db
+from models import Book, User, user_book_votes
+from schemas import VoteCreate, VoteResponse
+from auth import get_current_active_user
+
+router = APIRouter(prefix="/votes", tags=["votes"])
+
+@router.post("/", response_model=VoteResponse)
+def vote_book(
+    vote: VoteCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Vote for a book (like/unlike)"""
+    # Check if book exists
+    book = db.query(Book).filter(Book.id == vote.book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Check if user has already voted for this book
+    existing_vote = db.query(user_book_votes).filter(
+        user_book_votes.c.user_id == current_user.id,
+        user_book_votes.c.book_id == vote.book_id
+    ).first()
+    
+    if existing_vote:
+        # User has already voted, so unlike the book
+        db.execute(
+            user_book_votes.delete().where(
+                user_book_votes.c.user_id == current_user.id,
+                user_book_votes.c.book_id == vote.book_id
+            )
+        )
+        db.commit()
+        
+        # Refresh book to get updated vote count
+        db.refresh(book)
+        vote_count = len(book.voters)
+        
+        return VoteResponse(
+            book_id=vote.book_id,
+            user_id=current_user.id,
+            voted=False,
+            vote_count=vote_count
+        )
+    else:
+        # User hasn't voted yet, so like the book
+        db.execute(
+            user_book_votes.insert().values(
+                user_id=current_user.id,
+                book_id=vote.book_id
+            )
+        )
+        db.commit()
+        
+        # Refresh book to get updated vote count
+        db.refresh(book)
+        vote_count = len(book.voters)
+        
+        return VoteResponse(
+            book_id=vote.book_id,
+            user_id=current_user.id,
+            voted=True,
+            vote_count=vote_count
+        )
+
+@router.get("/book/{book_id}", response_model=VoteResponse)
+def get_book_vote_status(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get the vote status of a book for the current user"""
+    # Check if book exists
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Check if user has voted for this book
+    existing_vote = db.query(user_book_votes).filter(
+        user_book_votes.c.user_id == current_user.id,
+        user_book_votes.c.book_id == book_id
+    ).first()
+    
+    voted = existing_vote is not None
+    vote_count = len(book.voters)
+    
+    return VoteResponse(
+        book_id=book_id,
+        user_id=current_user.id,
+        voted=voted,
+        vote_count=vote_count
+    )
+
+@router.get("/user", response_model=list[VoteResponse])
+def get_user_votes(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get all books voted by the current user"""
+    voted_books = current_user.voted_books
+    
+    result = []
+    for book in voted_books:
+        result.append(VoteResponse(
+            book_id=book.id,
+            user_id=current_user.id,
+            voted=True,
+            vote_count=len(book.voters)
+        ))
+    
+    return result
+
+
+AUTH.PY
+
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+from database import get_db
+from models import User
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here-change-in-production")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# JWT token scheme
+security = HTTPBearer()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against its hash"""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """Hash a password"""
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create a JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str) -> Optional[str]:
+    """Verify a JWT token and return the username"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return None
+        return username
+    except JWTError:
+        return None
+
+def get_user_by_username(db: Session, username: str) -> Optional[User]:
+    """Get a user by username"""
+    return db.query(User).filter(User.username == username).first()
+
+def get_user_by_email(db: Session, email: str) -> Optional[User]:
+    """Get a user by email"""
+    return db.query(User).filter(User.email == email).first()
+
+def authenticate_user(db: Session, username: str, password: str) -> Optional[User]:
+    """Authenticate a user with username and password"""
+    user = get_user_by_username(db, username)
+    if not user:
+        return None
+    if not verify_password(password, user.hashed_password):
+        return None
+    return user
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    """Get the current authenticated user"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        token = credentials.credentials
+        username = verify_token(token)
+        if username is None:
+            raise credentials_exception
+    except Exception:
+        raise credentials_exception
+    
+    user = get_user_by_username(db, username)
+    if user is None:
+        raise credentials_exception
+    
+    return user
+
+def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
+    """Get the current active user"""
+    if not current_user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+def get_current_superuser(current_user: User = Depends(get_current_active_user)) -> User:
+    """Get the current superuser"""
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=400, 
+            detail="The user doesn't have enough privileges"
+        )
+    return current_user
+
+
+BOOKS_ROUTER.PY
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.orm import Session
+from sqlalchemy import and_
+from typing import List, Optional
+from database import get_db
+from models import Book, Author, User
+from schemas import BookCreate, BookUpdate, Book as BookSchema, VoteCreate, VoteResponse
+from auth import get_current_active_user
+
+router = APIRouter(prefix="/books", tags=["books"])
+
+@router.get("/", response_model=List[BookSchema])
+def get_books(
+    skip: int = Query(0, ge=0, description="Number of books to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of books to return"),
+    title: Optional[str] = Query(None, description="Filter by book title (partial match)"),
+    isbn: Optional[str] = Query(None, description="Filter by ISBN"),
+    author_id: Optional[int] = Query(None, description="Filter by author ID"),
+    author_name: Optional[str] = Query(None, description="Filter by author name (partial match)"),
+    is_published: Optional[bool] = Query(None, description="Filter by published status"),
+    min_price: Optional[float] = Query(None, description="Minimum price filter"),
+    max_price: Optional[float] = Query(None, description="Maximum price filter"),
+    db: Session = Depends(get_db)
+):
+    """Get all books with filtering and pagination"""
+    query = db.query(Book)
+    
+    # Apply filters
+    if title:
+        query = query.filter(Book.title.ilike(f"%{title}%"))
+    if isbn:
+        query = query.filter(Book.isbn.ilike(f"%{isbn}%"))
+    if author_id:
+        query = query.filter(Book.author_id == author_id)
+    if author_name:
+        query = query.join(Author).filter(Author.name.ilike(f"%{author_name}%"))
+    if is_published is not None:
+        query = query.filter(Book.is_published == is_published)
+    if min_price is not None:
+        query = query.filter(Book.price.isnot(None))
+        # Note: In a real app, you'd parse price strings to float for comparison
+    if max_price is not None:
+        query = query.filter(Book.price.isnot(None))
+        # Note: In a real app, you'd parse price strings to float for comparison
+    
+    # Apply pagination
+    books = query.offset(skip).limit(limit).all()
+    
+    # Add vote count to each book
+    for book in books:
+        book.vote_count = len(book.voters)
+    
+    return books
+
+@router.get("/{book_id}", response_model=BookSchema)
+def get_book(book_id: int, db: Session = Depends(get_db)):
+    """Get a specific book by ID"""
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Add vote count
+    book.vote_count = len(book.voters)
+    return book
+
+@router.post("/", response_model=BookSchema, status_code=status.HTTP_201_CREATED)
+def create_book(
+    book: BookCreate, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Create a new book (requires authentication)"""
+    # Check if author exists
+    author = db.query(Author).filter(Author.id == book.author_id).first()
+    if not author:
+        raise HTTPException(status_code=400, detail="Author not found")
+    
+    # Check if ISBN already exists (if provided)
+    if book.isbn:
+        existing_book = db.query(Book).filter(Book.isbn == book.isbn).first()
+        if existing_book:
+            raise HTTPException(status_code=400, detail="ISBN already exists")
+    
+    db_book = Book(**book.dict(), owner_id=current_user.id)
+    db.add(db_book)
+    db.commit()
+    db.refresh(db_book)
+    
+    # Add vote count
+    db_book.vote_count = 0
+    return db_book
+
+@router.put("/{book_id}", response_model=BookSchema)
+def update_book(
+    book_id: int, 
+    book: BookUpdate, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Update a book (only the owner can update)"""
+    db_book = db.query(Book).filter(Book.id == book_id).first()
+    if not db_book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Check if current user is the owner
+    if db_book.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403, 
+            detail="Not enough permissions. Only the book owner can update this book."
+        )
+    
+    # Check if author exists (if being updated)
+    if book.author_id and book.author_id != db_book.author_id:
+        author = db.query(Author).filter(Author.id == book.author_id).first()
+        if not author:
+            raise HTTPException(status_code=400, detail="Author not found")
+    
+    # Check if ISBN already exists (if being updated)
+    if book.isbn and book.isbn != db_book.isbn:
+        existing_book = db.query(Book).filter(Book.isbn == book.isbn).first()
+        if existing_book:
+            raise HTTPException(status_code=400, detail="ISBN already exists")
+    
+    # Update only provided fields
+    update_data = book.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_book, field, value)
+    
+    db.commit()
+    db.refresh(db_book)
+    
+    # Add vote count
+    db_book.vote_count = len(db_book.voters)
+    return db_book
+
+@router.delete("/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_book(
+    book_id: int, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Delete a book (only the owner can delete)"""
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Check if current user is the owner
+    if book.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403, 
+            detail="Not enough permissions. Only the book owner can delete this book."
+        )
+    
+    db.delete(book)
+    db.commit()
+    return None
+
+@router.get("/search/advanced", response_model=List[BookSchema])
+def advanced_search(
+    q: Optional[str] = Query(None, description="Search query for title and description"),
+    author_id: Optional[int] = Query(None, description="Filter by author ID"),
+    is_published: Optional[bool] = Query(None, description="Filter by published status"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db)
+):
+    """Advanced search with multiple filters"""
+    query = db.query(Book)
+    
+    if q:
+        query = query.filter(
+            and_(
+                Book.title.ilike(f"%{q}%"),
+                Book.description.ilike(f"%{q}%")
+            )
+        )
+    if author_id:
+        query = query.filter(Book.author_id == author_id)
+    if is_published is not None:
+        query = query.filter(Book.is_published == is_published)
+    
+    books = query.offset(skip).limit(limit).all()
+    
+    # Add vote count to each book
+    for book in books:
+        book.vote_count = len(book.voters)
+    
+    return books
+
+
+DATABASE.PY
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Database URL - Update this to your PostgreSQL connection
+SQLALCHEMY_DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "postgresql://postgres:swagath12345@localhost/fastapi_auth"
+)
+
+# Create engine
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+
+# Create SessionLocal class
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Create Base class
+Base = declarative_base()
+
+def get_db():
+    """Dependency to get database session"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def create_tables():
+    """Create all tables"""
+    Base.metadata.create_all(bind=engine)
+
+def drop_tables():
+    """Drop all tables"""
+    Base.metadata.drop_all(bind=engine)
+
+
+MAIN.PY
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from database import create_tables
+from routers import auth, books, authors, votes
+
+# Create FastAPI application
+app = FastAPI(
+    title="Assignment 3 - Authentication & Permissions",
+    version="1.0.0",
+    description="A FastAPI application with JWT authentication, user permissions, and voting system"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(auth.router)
+app.include_router(authors.router)
+app.include_router(books.router)
+app.include_router(votes.router)
+
+@app.on_event("startup")
+async def startup_event():
+    """Create tables on startup"""
+    create_tables()
+
+@app.get("/")
+def read_root():
+    """Root endpoint"""
+    return {
+        "message": "Assignment 3 - Authentication & Permissions",
+        "version": "1.0.0",
+        "description": "FastAPI application with JWT authentication, user permissions, and voting system",
+        "docs": "/docs",
+        "endpoints": {
+            "authentication": "/auth",
+            "authors": "/authors",
+            "books": "/books",
+            "votes": "/votes"
+        },
+        "features": [
+            "JWT-based authentication",
+            "Password hashing with bcrypt",
+            "User registration and login",
+            "Book ownership permissions",
+            "Voting system for books",
+            "Token expiry handling",
+            "Comprehensive test coverage"
+        ]
+    }
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "message": "Assignment 3 API is running successfully",
+        "database": "PostgreSQL",
+        "authentication": "JWT",
+        "features": [
+            "User authentication and authorization",
+            "Book CRUD with ownership checks",
+            "Voting system for books",
+            "Password hashing",
+            "Token-based security"
+        ]
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+
+MODELS.PY
+
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Boolean, Table
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from database import Base
+
+# Association table for many-to-many relationship between users and books (votes)
+user_book_votes = Table(
+    'user_book_votes',
+    Base.metadata,
+    Column('user_id', Integer, ForeignKey('users.id'), primary_key=True),
+    Column('book_id', Integer, ForeignKey('books.id'), primary_key=True),
+    Column('created_at', DateTime(timezone=True), server_default=func.now())
+)
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    email = Column(String(100), unique=True, nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_superuser = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    # One-to-many relationship with books (books created by this user)
+    books = relationship("Book", back_populates="owner", cascade="all, delete-orphan")
+    
+    # Many-to-many relationship with books (books voted by this user)
+    voted_books = relationship("Book", secondary=user_book_votes, back_populates="voters")
+
+class Author(Base):
+    __tablename__ = "authors"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False, index=True)
+    email = Column(String(100), unique=True, nullable=False, index=True)
+    bio = Column(Text, nullable=True)
+    birth_date = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    # One-to-many relationship with books
+    books = relationship("Book", back_populates="author", cascade="all, delete-orphan")
+
+class Book(Base):
+    __tablename__ = "books"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False, index=True)
+    description = Column(Text, nullable=True)
+    isbn = Column(String(20), unique=True, nullable=True, index=True)
+    publication_date = Column(DateTime, nullable=True)
+    price = Column(String(20), nullable=True)  # Using string for price to handle currency
+    is_published = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    # Foreign key to author
+    author_id = Column(Integer, ForeignKey("authors.id"), nullable=False, index=True)
+    
+    # Foreign key to user (owner who created the book)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    
+    # Many-to-one relationship with author
+    author = relationship("Author", back_populates="books")
+    
+    # Many-to-one relationship with user (owner)
+    owner = relationship("User", back_populates="books")
+    
+    # Many-to-many relationship with users (voters)
+    voters = relationship("User", secondary=user_book_votes, back_populates="voted_books")
+
+
+SCHEMAS.PY
+
+from pydantic import BaseModel, EmailStr
+from typing import Optional, List
+from datetime import datetime
+
+# User Schemas
+class UserBase(BaseModel):
+    username: str
+    email: str
+    is_active: bool = True
+
+class UserCreate(UserBase):
+    password: str
+
+class UserUpdate(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+    password: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class User(UserBase):
+    id: int
+    is_superuser: bool
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class UserInDB(User):
+    hashed_password: str
+
+# Token Schemas
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+# Author Schemas
+class AuthorBase(BaseModel):
+    name: str
+    email: str
+    bio: Optional[str] = None
+    birth_date: Optional[datetime] = None
+    is_active: bool = True
+
+class AuthorCreate(AuthorBase):
+    pass
+
+class AuthorUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    bio: Optional[str] = None
+    birth_date: Optional[datetime] = None
+    is_active: Optional[bool] = None
+
+class Author(AuthorBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class AuthorWithBooks(Author):
+    books: List['Book'] = []
+
+# Book Schemas
+class BookBase(BaseModel):
+    title: str
+    description: Optional[str] = None
+    isbn: Optional[str] = None
+    publication_date: Optional[datetime] = None
+    price: Optional[str] = None
+    is_published: bool = False
+    author_id: int
+
+class BookCreate(BookBase):
+    pass
+
+class BookUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    isbn: Optional[str] = None
+    publication_date: Optional[datetime] = None
+    price: Optional[str] = None
+    is_published: Optional[bool] = None
+    author_id: Optional[int] = None
+
+class Book(BookBase):
+    id: int
+    owner_id: int
+    created_at: datetime
+    updated_at: datetime
+    author: Optional[Author] = None
+    owner: Optional[User] = None
+    voters: List[User] = []
+    vote_count: Optional[int] = None
+    
+    class Config:
+        from_attributes = True
+
+# Vote Schemas
+class VoteCreate(BaseModel):
+    book_id: int
+
+class VoteResponse(BaseModel):
+    book_id: int
+    user_id: int
+    voted: bool
+    vote_count: int
+
+# Update forward references
+AuthorWithBooks.model_rebuild()
+Book.model_rebuild()
+
+
+SETUP.PY
+
+#!/usr/bin/env python3
+"""
+Setup script for Assignment 3 - Authentication & Permissions
+"""
+
+import subprocess
+import sys
+import os
+from pathlib import Path
+
+def run_command(command, description):
+    """Run a command and handle errors"""
+    print(f"🔄 {description}...")
+    try:
+        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+        print(f"✅ {description} completed successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ {description} failed: {e.stderr}")
+        return False
+
+def main():
+    """Main setup function"""
+    print("🚀 Setting up Assignment 3 - Authentication & Permissions")
+    print("=" * 60)
+    
+    # Check if we're in the right directory
+    if not Path("assignment_3").exists():
+        print("❌ Please run this script from the project root directory")
+        sys.exit(1)
+    
+    # Change to assignment_3 directory
+    os.chdir("assignment_3")
+    
+    # Create virtual environment
+    if not run_command("python -m venv venv", "Creating virtual environment"):
+        sys.exit(1)
+    
+    # Activate virtual environment and install dependencies
+    if sys.platform == "win32":
+        activate_cmd = "venv\\Scripts\\activate"
+        pip_cmd = "venv\\Scripts\\pip"
+    else:
+        activate_cmd = "source venv/bin/activate"
+        pip_cmd = "venv/bin/pip"
+    
+    if not run_command(f"{pip_cmd} install --upgrade pip", "Upgrading pip"):
+        sys.exit(1)
+    
+    if not run_command(f"{pip_cmd} install -r requirements.txt", "Installing dependencies"):
+        sys.exit(1)
+    
+    # Create .env file if it doesn't exist
+    if not Path(".env").exists():
+        env_content = """# Database Configuration
+DATABASE_URL=postgresql://postgres:swagath12345@localhost/fastapi_auth
+
+# JWT Configuration
+SECRET_KEY=your-secret-key-here-change-in-production-12345
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+
+# Environment
+ENVIRONMENT=development
+"""
+        with open(".env", "w") as f:
+            f.write(env_content)
+        print("✅ Created .env file")
+    
+    print("\n🎉 Setup completed successfully!")
+    print("\n📋 Next steps:")
+    print("1. Update the DATABASE_URL in .env file to match your PostgreSQL setup")
+    print("2. Change the SECRET_KEY in .env file for production")
+    print("3. Create the database: createdb fastapi_auth")
+    print("4. Run the application: python main.py")
+    print("5. Run tests: python -m pytest test_assignment3.py -v --cov=.")
+    print("\n🌐 API Documentation will be available at: http://127.0.0.1:8000/docs")
+
+if __name__ == "__main__":
+    main()
+
+
+TEST_ASSIGNMENT3.PY
+
+import pytest
+import pytest_asyncio
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from database import get_db, Base
+from main import app
+from models import User, Author, Book
+from auth import get_password_hash, create_access_token
+from datetime import datetime, timedelta
+import json
+
+# Import all router modules to ensure they're covered
+import routers.auth
+import routers.authors
+import routers.books
+import routers.votes
+
+# Test database setup
+SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def override_get_db():
+    try:
+        db = TestingSessionLocal()
+        yield db
+    finally:
+        db.close()
+
+app.dependency_overrides[get_db] = override_get_db
+
+client = TestClient(app)
+
+@pytest.fixture(scope="function")
+def setup_database():
+    """Setup test database for each test"""
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+
+@pytest.fixture
+def test_user():
+    """Create a test user"""
+    return {
+        "username": "testuser",
+        "email": "test@example.com",
+        "password": "testpassword123"
+    }
+
+@pytest.fixture
+def test_author():
+    """Create a test author"""
+    return {
+        "name": "Test Author",
+        "email": "author@example.com",
+        "bio": "A test author",
+        "is_active": True
+    }
+
+@pytest.fixture
+def test_book_data():
+    """Create test book data"""
+    return {
+        "title": "Test Book",
+        "description": "A test book",
+        "isbn": "1234567890",
+        "is_published": True,
+        "author_id": 1
+    }
+
+@pytest.fixture
+def auth_headers(test_user, setup_database):
+    """Create authentication headers for test user"""
+    # Register user
+    response = client.post("/auth/register", json=test_user)
+    assert response.status_code == 201
+    
+    # Login user
+    login_data = {
+        "username": test_user["username"],
+        "password": test_user["password"]
+    }
+    response = client.post("/auth/login", data=login_data)
+    assert response.status_code == 200
+    
+    token = response.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+@pytest.fixture
+def second_user():
+    """Create a second test user"""
+    return {
+        "username": "testuser2",
+        "email": "test2@example.com",
+        "password": "testpassword123"
+    }
+
+@pytest.fixture
+def second_user_headers(second_user, setup_database):
+    """Create authentication headers for second user"""
+    # Register second user
+    response = client.post("/auth/register", json=second_user)
+    assert response.status_code == 201
+    
+    # Login second user
+    login_data = {
+        "username": second_user["username"],
+        "password": second_user["password"]
+    }
+    response = client.post("/auth/login", data=login_data)
+    assert response.status_code == 200
+    
+    token = response.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+class TestAuthentication:
+    """Test authentication endpoints"""
+    
+    def test_register_user(self, setup_database, test_user):
+        """Test user registration"""
+        response = client.post("/auth/register", json=test_user)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["username"] == test_user["username"]
+        assert data["email"] == test_user["email"]
+        assert "id" in data
+        assert "hashed_password" not in data
+    
+    def test_register_duplicate_username(self, setup_database, test_user):
+        """Test registration with duplicate username"""
+        # Register first user
+        client.post("/auth/register", json=test_user)
+        
+        # Try to register with same username
+        response = client.post("/auth/register", json=test_user)
+        assert response.status_code == 400
+        assert "Username already registered" in response.json()["detail"]
+    
+    def test_register_duplicate_email(self, setup_database, test_user):
+        """Test registration with duplicate email"""
+        # Register first user
+        client.post("/auth/register", json=test_user)
+        
+        # Try to register with same email
+        duplicate_user = test_user.copy()
+        duplicate_user["username"] = "different_username"
+        response = client.post("/auth/register", json=duplicate_user)
+        assert response.status_code == 400
+        assert "Email already registered" in response.json()["detail"]
+    
+    def test_login_success(self, setup_database, test_user):
+        """Test successful login"""
+        # Register user first
+        client.post("/auth/register", json=test_user)
+        
+        # Login
+        login_data = {
+            "username": test_user["username"],
+            "password": test_user["password"]
+        }
+        response = client.post("/auth/login", data=login_data)
+        assert response.status_code == 200
+        data = response.json()
+        assert "access_token" in data
+        assert data["token_type"] == "bearer"
+    
+    def test_login_wrong_password(self, setup_database, test_user):
+        """Test login with wrong password"""
+        # Register user first
+        client.post("/auth/register", json=test_user)
+        
+        # Login with wrong password
+        login_data = {
+            "username": test_user["username"],
+            "password": "wrongpassword"
+        }
+        response = client.post("/auth/login", data=login_data)
+        assert response.status_code == 401
+        assert "Incorrect username or password" in response.json()["detail"]
+    
+    def test_login_nonexistent_user(self, setup_database):
+        """Test login with nonexistent user"""
+        login_data = {
+            "username": "nonexistent",
+            "password": "password"
+        }
+        response = client.post("/auth/login", data=login_data)
+        assert response.status_code == 401
+        assert "Incorrect username or password" in response.json()["detail"]
+    
+    def test_get_current_user(self, setup_database, test_user, auth_headers):
+        """Test getting current user information"""
+        response = client.get("/auth/me", headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["username"] == test_user["username"]
+        assert data["email"] == test_user["email"]
+    
+    def test_get_current_user_no_token(self, setup_database):
+        """Test getting current user without token"""
+        response = client.get("/auth/me")
+        assert response.status_code == 403
+    
+    def test_get_current_user_invalid_token(self, setup_database):
+        """Test getting current user with invalid token"""
+        headers = {"Authorization": "Bearer invalid_token"}
+        response = client.get("/auth/me", headers=headers)
+        assert response.status_code == 401
+
+class TestTokenExpiry:
+    """Test token expiry functionality"""
+    
+    def test_token_expiry(self, setup_database, test_user):
+        """Test that tokens expire after the specified time"""
+        # Register user
+        client.post("/auth/register", json=test_user)
+        
+        # Create a token with very short expiry (1 second)
+        from auth import create_access_token
+        from datetime import timedelta
+        token = create_access_token(
+            data={"sub": test_user["username"]}, 
+            expires_delta=timedelta(seconds=1)
+        )
+        
+        # Use token immediately (should work)
+        headers = {"Authorization": f"Bearer {token}"}
+        response = client.get("/auth/me", headers=headers)
+        assert response.status_code == 200
+        
+        # Wait for token to expire
+        import time
+        time.sleep(2)
+        
+        # Try to use expired token (should fail)
+        response = client.get("/auth/me", headers=headers)
+        assert response.status_code == 401
+
+class TestBooks:
+    """Test book endpoints with authentication and permissions"""
+    
+    def test_create_book_unauthorized(self, setup_database, test_author, test_book_data):
+        """Test creating book without authentication"""
+        # Create author first
+        client.post("/authors/", json=test_author)
+        
+        response = client.post("/books/", json=test_book_data)
+        assert response.status_code == 403
+    
+    def test_create_book_authorized(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test creating book with authentication"""
+        # Create author first
+        client.post("/authors/", json=test_author)
+        
+        response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["title"] == test_book_data["title"]
+        assert "owner_id" in data
+    
+    def test_get_books_public(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test getting books (public endpoint)"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        client.post("/books/", json=test_book_data, headers=auth_headers)
+        
+        response = client.get("/books/")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["title"] == test_book_data["title"]
+        assert "vote_count" in data[0]
+    
+    def test_update_book_owner(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test updating book as owner"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        # Update book
+        update_data = {"title": "Updated Book Title"}
+        response = client.put(f"/books/{book_id}", json=update_data, headers=auth_headers)
+        assert response.status_code == 200
+        assert response.json()["title"] == "Updated Book Title"
+    
+    def test_update_book_not_owner(self, setup_database, test_author, test_book_data, auth_headers, second_user_headers):
+        """Test updating book as non-owner"""
+        # Create author and book with first user
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        # Try to update book with second user
+        update_data = {"title": "Updated Book Title"}
+        response = client.put(f"/books/{book_id}", json=update_data, headers=second_user_headers)
+        assert response.status_code == 403
+        assert "Not enough permissions" in response.json()["detail"]
+    
+    def test_delete_book_owner(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test deleting book as owner"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        # Delete book
+        response = client.delete(f"/books/{book_id}", headers=auth_headers)
+        assert response.status_code == 204
+        
+        # Verify book is deleted
+        response = client.get(f"/books/{book_id}")
+        assert response.status_code == 404
+    
+    def test_delete_book_not_owner(self, setup_database, test_author, test_book_data, auth_headers, second_user_headers):
+        """Test deleting book as non-owner"""
+        # Create author and book with first user
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        # Try to delete book with second user
+        response = client.delete(f"/books/{book_id}", headers=second_user_headers)
+        assert response.status_code == 403
+        assert "Not enough permissions" in response.json()["detail"]
+
+class TestVotes:
+    """Test voting functionality"""
+    
+    def test_vote_book_unauthorized(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test voting without authentication"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        vote_data = {"book_id": book_id}
+        response = client.post("/votes/", json=vote_data)
+        assert response.status_code == 403
+    
+    def test_vote_book_authorized(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test voting with authentication"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        # Vote for book
+        vote_data = {"book_id": book_id}
+        response = client.post("/votes/", json=vote_data, headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["book_id"] == book_id
+        assert data["voted"] == True
+        assert data["vote_count"] == 1
+    
+    def test_unvote_book(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test unvoting a book"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        # Vote for book
+        vote_data = {"book_id": book_id}
+        response = client.post("/votes/", json=vote_data, headers=auth_headers)
+        assert response.status_code == 200
+        assert response.json()["voted"] == True
+        
+        # Unvote book (vote again)
+        response = client.post("/votes/", json=vote_data, headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["voted"] == False
+        assert data["vote_count"] == 0
+    
+    def test_vote_nonexistent_book(self, setup_database, auth_headers):
+        """Test voting for nonexistent book"""
+        vote_data = {"book_id": 999}
+        response = client.post("/votes/", json=vote_data, headers=auth_headers)
+        assert response.status_code == 404
+        assert "Book not found" in response.json()["detail"]
+    
+    def test_get_vote_status(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test getting vote status"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        # Get vote status (should be not voted)
+        response = client.get(f"/votes/book/{book_id}", headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["voted"] == False
+        assert data["vote_count"] == 0
+        
+        # Vote for book
+        vote_data = {"book_id": book_id}
+        client.post("/votes/", json=vote_data, headers=auth_headers)
+        
+        # Get vote status (should be voted)
+        response = client.get(f"/votes/book/{book_id}", headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["voted"] == True
+        assert data["vote_count"] == 1
+    
+    def test_get_user_votes(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test getting user's voted books"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        create_response = client.post("/books/", json=test_book_data, headers=auth_headers)
+        book_id = create_response.json()["id"]
+        
+        # Initially no votes
+        response = client.get("/votes/user", headers=auth_headers)
+        assert response.status_code == 200
+        assert len(response.json()) == 0
+        
+        # Vote for book
+        vote_data = {"book_id": book_id}
+        client.post("/votes/", json=vote_data, headers=auth_headers)
+        
+        # Should have one vote
+        response = client.get("/votes/user", headers=auth_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["book_id"] == book_id
+        assert data[0]["voted"] == True
+
+class TestAuthors:
+    """Test author endpoints (public)"""
+    
+    def test_create_author(self, setup_database, test_author):
+        """Test creating author"""
+        response = client.post("/authors/", json=test_author)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["name"] == test_author["name"]
+        assert data["email"] == test_author["email"]
+    
+    def test_get_authors(self, setup_database, test_author):
+        """Test getting authors"""
+        client.post("/authors/", json=test_author)
+        
+        response = client.get("/authors/")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == test_author["name"]
+    
+    def test_get_author_by_id(self, setup_database, test_author):
+        """Test getting author by ID"""
+        create_response = client.post("/authors/", json=test_author)
+        author_id = create_response.json()["id"]
+        
+        response = client.get(f"/authors/{author_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == test_author["name"]
+
+class TestIntegration:
+    """Integration tests"""
+    
+    def test_full_workflow(self, setup_database, test_user, test_author, test_book_data, second_user):
+        """Test complete workflow: register users, create author, create book, vote"""
+        # Register first user
+        response = client.post("/auth/register", json=test_user)
+        assert response.status_code == 201
+        
+        # Register second user
+        response = client.post("/auth/register", json=second_user)
+        assert response.status_code == 201
+        
+        # Login first user
+        login_data = {"username": test_user["username"], "password": test_user["password"]}
+        response = client.post("/auth/login", data=login_data)
+        token1 = response.json()["access_token"]
+        headers1 = {"Authorization": f"Bearer {token1}"}
+        
+        # Login second user
+        login_data = {"username": second_user["username"], "password": second_user["password"]}
+        response = client.post("/auth/login", data=login_data)
+        token2 = response.json()["access_token"]
+        headers2 = {"Authorization": f"Bearer {token2}"}
+        
+        # Create author
+        response = client.post("/authors/", json=test_author)
+        assert response.status_code == 201
+        author_id = response.json()["id"]
+        
+        # Create book with first user
+        book_data = test_book_data.copy()
+        book_data["author_id"] = author_id
+        response = client.post("/books/", json=book_data, headers=headers1)
+        assert response.status_code == 201
+        book_id = response.json()["id"]
+        
+        # Second user votes for book
+        vote_data = {"book_id": book_id}
+        response = client.post("/votes/", json=vote_data, headers=headers2)
+        assert response.status_code == 200
+        assert response.json()["voted"] == True
+        assert response.json()["vote_count"] == 1
+        
+        # First user tries to update book (should work)
+        update_data = {"title": "Updated by Owner"}
+        response = client.put(f"/books/{book_id}", json=update_data, headers=headers1)
+        assert response.status_code == 200
+        
+        # Second user tries to update book (should fail)
+        update_data = {"title": "Updated by Non-Owner"}
+        response = client.put(f"/books/{book_id}", json=update_data, headers=headers2)
+        assert response.status_code == 403
+
+class TestAdditionalCoverage:
+    """Additional tests to improve coverage"""
+    
+    def test_root_endpoint(self, setup_database):
+        """Test root endpoint"""
+        response = client.get("/")
+        assert response.status_code == 200
+        data = response.json()
+        assert "message" in data
+        assert "version" in data
+        assert "endpoints" in data
+    
+    def test_health_endpoint(self, setup_database):
+        """Test health endpoint"""
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert "database" in data
+        assert "authentication" in data
+    
+    def test_books_advanced_search(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test advanced search functionality"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        client.post("/books/", json=test_book_data, headers=auth_headers)
+        
+        # Test advanced search
+        response = client.get("/books/search/advanced?q=test")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert "test" in data[0]["title"].lower()
+    
+    def test_books_with_filters(self, setup_database, test_author, test_book_data, auth_headers):
+        """Test books endpoint with various filters"""
+        # Create author and book
+        client.post("/authors/", json=test_author)
+        client.post("/books/", json=test_book_data, headers=auth_headers)
+        
+        # Test with title filter
+        response = client.get("/books/?title=test")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        
+        # Test with author name filter
+        response = client.get("/books/?author_name=test")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+    
+    def test_authors_with_filters(self, setup_database, test_author):
+        """Test authors endpoint with filters"""
+        client.post("/authors/", json=test_author)
+        
+        # Test with name filter
+        response = client.get("/authors/?name=test")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        
+        # Test with email filter
+        response = client.get("/authors/?email=author@example.com")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+    
+    def test_update_author(self, setup_database, test_author):
+        """Test updating author"""
+        create_response = client.post("/authors/", json=test_author)
+        author_id = create_response.json()["id"]
+        
+        update_data = {"name": "Updated Author Name"}
+        response = client.put(f"/authors/{author_id}", json=update_data)
+        assert response.status_code == 200
+        assert response.json()["name"] == "Updated Author Name"
+    
+    def test_delete_author(self, setup_database, test_author):
+        """Test deleting author"""
+        create_response = client.post("/authors/", json=test_author)
+        author_id = create_response.json()["id"]
+        
+        response = client.delete(f"/authors/{author_id}")
+        assert response.status_code == 204
+        
+        # Verify author is deleted
+        response = client.get(f"/authors/{author_id}")
+        assert response.status_code == 404
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--cov=.", "--cov-report=html"])
+
+
+VOTES_ROUTER.PY
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from database import get_db
+from models import Book, User, user_book_votes
+from schemas import VoteCreate, VoteResponse
+from auth import get_current_active_user
+
+router = APIRouter(prefix="/votes", tags=["votes"])
+
+@router.post("/", response_model=VoteResponse)
+def vote_book(
+    vote: VoteCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Vote for a book (like/unlike)"""
+    # Check if book exists
+    book = db.query(Book).filter(Book.id == vote.book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Check if user has already voted for this book
+    existing_vote = db.query(user_book_votes).filter(
+        user_book_votes.c.user_id == current_user.id,
+        user_book_votes.c.book_id == vote.book_id
+    ).first()
+    
+    if existing_vote:
+        # User has already voted, so unlike the book
+        db.execute(
+            user_book_votes.delete().where(
+                user_book_votes.c.user_id == current_user.id,
+                user_book_votes.c.book_id == vote.book_id
+            )
+        )
+        db.commit()
+        
+        # Refresh book to get updated vote count
+        db.refresh(book)
+        vote_count = len(book.voters)
+        
+        return VoteResponse(
+            book_id=vote.book_id,
+            user_id=current_user.id,
+            voted=False,
+            vote_count=vote_count
+        )
+    else:
+        # User hasn't voted yet, so like the book
+        db.execute(
+            user_book_votes.insert().values(
+                user_id=current_user.id,
+                book_id=vote.book_id
+            )
+        )
+        db.commit()
+        
+        # Refresh book to get updated vote count
+        db.refresh(book)
+        vote_count = len(book.voters)
+        
+        return VoteResponse(
+            book_id=vote.book_id,
+            user_id=current_user.id,
+            voted=True,
+            vote_count=vote_count
+        )
+
+@router.get("/book/{book_id}", response_model=VoteResponse)
+def get_book_vote_status(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get the vote status of a book for the current user"""
+    # Check if book exists
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Check if user has voted for this book
+    existing_vote = db.query(user_book_votes).filter(
+        user_book_votes.c.user_id == current_user.id,
+        user_book_votes.c.book_id == book_id
+    ).first()
+    
+    voted = existing_vote is not None
+    vote_count = len(book.voters)
+    
+    return VoteResponse(
+        book_id=book_id,
+        user_id=current_user.id,
+        voted=voted,
+        vote_count=vote_count
+    )
+
+@router.get("/user", response_model=list[VoteResponse])
+def get_user_votes(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get all books voted by the current user"""
+    voted_books = current_user.voted_books
+    
+    result = []
+    for book in voted_books:
+        result.append(VoteResponse(
+            book_id=book.id,
+            user_id=current_user.id,
+            voted=True,
+            vote_count=len(book.voters)
+        ))
+    
+    return result
