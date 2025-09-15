@@ -1,0 +1,299 @@
+MAIN.PY
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+# Create FastAPI application
+app = FastAPI(
+    title="Assignment 1 - FastAPI Bootstrap",
+    version="1.0.0",
+    description="A simple FastAPI application for Assignment 1 - Environment & Bootstrap"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def read_root():
+    """Root endpoint - returns a welcome message"""
+    return {
+        "message": "Welcome to Assignment 1 - FastAPI Bootstrap!",
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs",
+        "assignment": "Environment & Bootstrap"
+    }
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "message": "FastAPI server is running successfully",
+        "timestamp": "2025-01-09T10:50:00Z"
+    }
+
+@app.get("/assignment1")
+def assignment1_info():
+    """Assignment 1 specific information"""
+    return {
+        "assignment": "Assignment 1 - Environment & Bootstrap",
+        "description": "Set up Python and VS Code; create a virtual environment; add all packages to requirements.txt; write a single command that installs the dependencies and launches the FastAPI server",
+        "status": "completed",
+        "features": [
+            "Virtual environment setup",
+            "Dependencies management with requirements.txt",
+            "PowerShell setup script (setup.ps1)",
+            "FastAPI server with Swagger UI",
+            "Health check endpoint"
+        ]
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+TEST_ASSIGNMENT_2.PY
+
+#!/usr/bin/env python3
+"""
+Test script to verify Assignment 2 setup is working correctly.
+Run this script to test all endpoints and verify the FastAPI server is functioning.
+"""
+
+import requests
+import json
+import sys
+from typing import Dict, Any
+
+def test_endpoint(url: str, method: str = "GET", data: Dict = None, expected_status: int = 200) -> Dict[str, Any]:
+    """Test a single endpoint and return the result."""
+    try:
+        if method == "GET":
+            response = requests.get(url, timeout=5)
+        elif method == "POST":
+            response = requests.post(url, json=data, timeout=5)
+        elif method == "PUT":
+            response = requests.put(url, json=data, timeout=5)
+        elif method == "DELETE":
+            response = requests.delete(url, timeout=5)
+        else:
+            return {
+                "url": url,
+                "method": method,
+                "status_code": None,
+                "success": False,
+                "error": f"Unsupported method: {method}"
+            }
+        
+        return {
+            "url": url,
+            "method": method,
+            "status_code": response.status_code,
+            "success": response.status_code == expected_status,
+            "data": response.json() if response.headers.get('content-type', '').startswith('application/json') else response.text[:200]
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "url": url,
+            "method": method,
+            "status_code": None,
+            "success": False,
+            "error": str(e)
+        }
+
+def cleanup_test_data(base_url):
+    """Clean up any existing test data to avoid conflicts"""
+    try:
+        # Get all authors and books
+        authors_response = requests.get(f"{base_url}/authors", timeout=5)
+        books_response = requests.get(f"{base_url}/books", timeout=5)
+        
+        if authors_response.status_code == 200:
+            authors = authors_response.json()
+            # Delete all test authors
+            for author in authors:
+                if "test.author" in author.get("email", ""):
+                    requests.delete(f"{base_url}/authors/{author['id']}", timeout=5)
+        
+        if books_response.status_code == 200:
+            books = books_response.json()
+            # Delete all test books
+            for book in books:
+                if "Test Book" in book.get("title", ""):
+                    requests.delete(f"{base_url}/books/{book['id']}", timeout=5)
+    except:
+        pass  # Ignore cleanup errors
+
+def main():
+    """Run all tests for Assignment 2 setup."""
+    print("=== Assignment 2 - Core API & Database Test ===")
+    print("Testing FastAPI server with Authors and Books endpoints...")
+    print()
+    
+    base_url = "http://127.0.0.1:8000"
+    
+    # Clean up any existing test data
+    print("Cleaning up any existing test data...")
+    cleanup_test_data(base_url)
+    print()
+    
+    # Test basic endpoints first
+    basic_endpoints = [
+        ("/", "GET", "Root endpoint"),
+        ("/health", "GET", "Health check endpoint"),
+        ("/authors", "GET", "Get all authors"),
+        ("/books", "GET", "Get all books"),
+    ]
+    
+    # Test data for POST requests - using unique identifiers to avoid conflicts
+    import time
+    timestamp = int(time.time())
+    
+    author_data = {
+        "name": f"Test Author {timestamp}",
+        "email": f"test.author.{timestamp}@example.com",
+        "bio": "A test author for testing purposes",
+        "is_active": True
+    }
+    
+    book_data = {
+        "title": f"Test Book {timestamp}",
+        "description": "A test book for testing purposes",
+        "isbn": f"978-{timestamp}",
+        "is_published": True,
+        "author_id": 1  # This will be updated after author creation
+    }
+    
+    results = []
+    all_passed = True
+    
+    # Test basic endpoints first
+    for endpoint, method, description in basic_endpoints:
+        print(f"Testing {description} ({method} {base_url}{endpoint})...")
+        result = test_endpoint(f"{base_url}{endpoint}", method)
+        results.append(result)
+        
+        if result["success"]:
+            print(f"✅ {description} - Status: {result['status_code']}")
+            print(f"   Response: {json.dumps(result['data'], indent=2)}")
+        else:
+            print(f"❌ {description} - Failed")
+            if "error" in result:
+                print(f"   Error: {result['error']}")
+            else:
+                print(f"   Status: {result['status_code']}")
+            all_passed = False
+        print()
+    
+    # Test POST endpoints (create data)
+    print("Testing POST endpoints (creating test data)...")
+    
+    # Create author
+    print("Creating test author...")
+    author_result = test_endpoint(f"{base_url}/authors", "POST", author_data, 201)
+    results.append(author_result)
+    
+    if author_result["success"]:
+        print(f"✅ Author created - Status: {author_result['status_code']}")
+        author_id = author_result['data']['id']
+        print(f"   Author ID: {author_id}")
+        
+        # Update book data with real author ID
+        book_data["author_id"] = author_id
+        
+        # Create book
+        print("Creating test book...")
+        book_result = test_endpoint(f"{base_url}/books", "POST", book_data, 201)
+        results.append(book_result)
+        
+        if book_result["success"]:
+            print(f"✅ Book created - Status: {book_result['status_code']}")
+            book_id = book_result['data']['id']
+            print(f"   Book ID: {book_id}")
+        else:
+            print(f"❌ Book creation failed")
+            if "error" in book_result:
+                print(f"   Error: {book_result['error']}")
+            all_passed = False
+    else:
+        print(f"❌ Author creation failed")
+        if "error" in author_result:
+            print(f"   Error: {author_result['error']}")
+        all_passed = False
+    
+    print()
+    
+    # Test GET by ID endpoints after creating data (only if creation was successful)
+    if author_result["success"] and book_result["success"]:
+        print("Testing GET by ID endpoints (verifying created data)...")
+        
+        # Test get author by ID
+        print(f"Testing Get author by ID (GET {base_url}/authors/{author_id})...")
+        author_get_result = test_endpoint(f"{base_url}/authors/{author_id}", "GET")
+        results.append(author_get_result)
+        
+        if author_get_result["success"]:
+            print(f"✅ Get author by ID - Status: {author_get_result['status_code']}")
+            print(f"   Author: {author_get_result['data']['name']}")
+        else:
+            print(f"❌ Get author by ID - Failed")
+            if "error" in author_get_result:
+                print(f"   Error: {author_get_result['error']}")
+            else:
+                print(f"   Status: {author_get_result['status_code']}")
+            all_passed = False
+        print()
+        
+        # Test get book by ID
+        print(f"Testing Get book by ID (GET {base_url}/books/{book_id})...")
+        book_get_result = test_endpoint(f"{base_url}/books/{book_id}", "GET")
+        results.append(book_get_result)
+        
+        if book_get_result["success"]:
+            print(f"✅ Get book by ID - Status: {book_get_result['status_code']}")
+            print(f"   Book: {book_get_result['data']['title']}")
+        else:
+            print(f"❌ Get book by ID - Failed")
+            if "error" in book_get_result:
+                print(f"   Error: {book_get_result['error']}")
+            else:
+                print(f"   Status: {book_get_result['status_code']}")
+            all_passed = False
+        print()
+    else:
+        print("Skipping GET by ID tests due to creation failures...")
+        print()
+    
+    # Summary
+    print("=== Test Summary ===")
+    passed_count = sum(1 for r in results if r["success"])
+    total_count = len(results)
+    
+    print(f"Tests passed: {passed_count}/{total_count}")
+    
+    if all_passed:
+        print("🎉 All tests passed! Assignment 2 setup is working correctly.")
+        print()
+        print("Next steps:")
+        print("1. Open http://127.0.0.1:8000/docs in your browser")
+        print("2. Import postman_collection.json into Postman")
+        print("3. Test all CRUD operations")
+        print("4. Run Alembic migrations: alembic upgrade head")
+        return 0
+    else:
+        print("❌ Some tests failed. Please check the server is running.")
+        print("Make sure to run: uvicorn main:app --host 127.0.0.1 --port 8000")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
